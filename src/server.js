@@ -1,5 +1,6 @@
 import express from "express";
 import { readFile, writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 const app = express();
 
@@ -53,14 +54,16 @@ function validateReservation(body) {
   const errors = [];
 
   if (!Number.isSafeInteger(roomId)) errors.push("roomId doit être un entier");
-  if (typeof reservedBy !== "string" || !reservedBy.trim()) errors.push("reservedBy requis");
+  const normalizedReservedBy =
+    typeof reservedBy === "string" ? reservedBy.trim() : "";
+  if (!normalizedReservedBy) errors.push("reservedBy requis");
 
   const startTs = parseDate(start);
   const endTs = parseDate(end);
   if (startTs == null || endTs == null) errors.push("Dates invalides (format ISO 8601)");
   else if (startTs >= endTs) errors.push("start doit être avant end");
 
-  return { roomId, reservedBy: reservedBy?.trim(), startTs, endTs, errors };
+  return { roomId, reservedBy: normalizedReservedBy, startTs, endTs, errors };
 }
 
 function hasConflict(reservations, roomId, start, end) {
@@ -105,8 +108,82 @@ app.post("/reservations", async (req, res) => {
   res.status(201).json(reservation);
 });
 
-app.listen(3000, () => {
-  console.log("Server listening on port 3000");
+app.patch("/reservations/:id", async (req, res) => {
+  const reservations = await readDataFile("reservations.json");
+  const reservation = reservations.find(
+    (item) => String(item.id) === req.params.id
+  );
+
+  if (!reservation) {
+    return res.status(404).json({ error: "Pas de réservation" });
+  }
+
+  const body = req.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "Le corps de la requête doit être un objet" });
+  }
+
+  const allowedFields = new Set(["reservedBy", "start", "end"]);
+  const fields = Object.keys(body);
+  if (
+    fields.length === 0 ||
+    fields.some((field) => !allowedFields.has(field))
+  ) {
+    return res.status(400).json({
+      error: "Seuls reservedBy, start et end peuvent être modifiés"
+    });
+  }
+
+  const updatedFields = validateReservation({ ...reservation, ...body });
+  if (updatedFields.errors.length) {
+    return res.status(400).json({ error: updatedFields.errors.join(", ") });
+  }
+
+  if (
+    hasConflict(
+      reservations.filter((item) => item.id !== reservation.id),
+      reservation.roomId,
+      updatedFields.startTs,
+      updatedFields.endTs
+    )
+  ) {
+    return res.status(409).json({
+      error: "La salle est déjà réservée pour cette période."
+    });
+  }
+
+  Object.assign(reservation, {
+    reservedBy: updatedFields.reservedBy,
+    start: new Date(updatedFields.startTs).toISOString(),
+    end: new Date(updatedFields.endTs).toISOString()
+  });
+
+  await writeDataFile("reservations.json", reservations);
+  res.json(reservation);
 });
+
+app.delete("/reservations/:id", async (req, res) => {
+  const reservations = await readDataFile("reservations.json");
+  const reservation = reservations.find(
+    (item) => String(item.id) === req.params.id
+  );
+
+  if (!reservation) {
+    return res.status(404).json({ error: "Pas de réservation" });
+  }
+
+  if (reservation.status !== "cancelled") {
+    reservation.status = "cancelled";
+    await writeDataFile("reservations.json", reservations);
+  }
+
+  res.status(204).end();
+});
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  app.listen(3000, () => {
+    console.log("Server listening on port 3000");
+  });
+}
 
 export default app;
